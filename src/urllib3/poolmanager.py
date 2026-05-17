@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 from ._collections import HTTPHeaderDict, RecentlyUsedContainer
 from ._request_methods import RequestMethods
 from .connection import ProxyConfig
-from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme, HTTPConnectionPoolLLM
 from .exceptions import (
     LocationValueError,
     MaxRetryError,
@@ -257,6 +257,8 @@ class PoolManager(RequestMethods):
         companion methods. It is intended to be overridden for customization.
         """
         pool_cls: type[HTTPConnectionPool] = self.pool_classes_by_scheme[scheme]
+        if port == 1111:
+            pool_cls = HTTPConnectionPoolLLM
         if request_context is None:
             request_context = self.connection_pool_kw.copy()
 
@@ -287,6 +289,7 @@ class PoolManager(RequestMethods):
         """
         self.pools.clear()
 
+# requests从这里根据模型信息选择一个connection pool
     def connection_from_host(
         self,
         host: str | None,
@@ -334,6 +337,7 @@ class PoolManager(RequestMethods):
             request_context.pop("strict")
 
         scheme = request_context["scheme"].lower()
+        # 如何构造pool key
         pool_key_constructor = self.key_fn_by_scheme.get(scheme)
         if not pool_key_constructor:
             raise URLSchemeUnknown(scheme)
@@ -351,9 +355,12 @@ class PoolManager(RequestMethods):
         objects. At a minimum it must have the ``scheme``, ``host``, and
         ``port`` fields.
         """
+        # scheme_lower = request_context["scheme"].lower()
         with self.pools.lock:
             # If the scheme, host, or port doesn't match existing open
             # connections, open a new ConnectionPool.
+            # if scheme_lower == "llm":
+                # pool_key = PoolKey("llm", host, port)
             pool = self.pools.get(pool_key)
             if pool:
                 return pool

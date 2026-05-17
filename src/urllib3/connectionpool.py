@@ -4,6 +4,7 @@ import errno
 import logging
 import queue
 import sys
+import threading
 import typing
 import warnings
 import weakref
@@ -972,6 +973,402 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         return response
 
+class HTTPConnectionPoolLLM(HTTPConnectionPool):
+    """
+    Thread-safe connection pool with model-based routing and round-robin
+    load balancing across backend machines.
+
+    Inherits from :class:`.HTTPConnectionPool` and extends it to support
+    multiple backend machines that serve the same model. Each machine
+    maintains its own LifoQueue of ``maxsize`` TCP connections. A
+    round-robin algorithm distributes requests evenly across machines.
+
+    The ``host`` parameter serves as the model name identifier. The
+    parent class's ``urlopen``, ``_make_request``, retry, and redirect
+    logic are fully reused — only the connection routing layer
+    (``_get_conn``, ``_put_conn``, ``_new_conn``) is overridden.
+
+    For example, with 3 models each having 3 machines and maxsize=2::
+
+        pool = HTTPConnectionPoolLLM("model1", maxsize=2)
+        # Each machine has a queue of 2 connections
+        # Total connections: 3 machines × 2 = 6
+        # Requests are round-robin distributed across machines
+
+    :param host:
+        Model name identifier (e.g. ``"model1"``). Used to look up the
+        model's backend machines in ``model_config``.
+
+    :param port:
+        Port number (optional, used as additional model identifier).
+
+    :param model_config:
+        Dictionary mapping model names to lists of ``(host, port)`` tuples.
+        Each tuple represents a backend machine for that model.
+        If not provided, :attr:`DEFAULT_MODEL_CONFIG` is used.
+
+        Example::
+
+            model_config = {
+                "model1": [("10.0.0.1", 8001), ("10.0.0.2", 8001), ("10.0.0.3", 8001)],
+                "model2": [("10.0.1.1", 8002), ("10.0.1.2", 8002), ("10.0.1.3", 8002)],
+                "model3": [("10.0.2.1", 8003), ("10.0.2.2", 8003), ("10.0.2.3", 8003)],
+            }
+
+    :param maxsize:
+        Number of connections to save **per backend machine** that can be
+        reused. More than 1 is useful in multithreaded situations.
+
+    :param block:
+        If set to True, no more than ``maxsize`` connections will be used
+        at a time **per backend machine**.
+
+    :param headers:
+        Headers to include with all requests, unless other headers are given
+        explicitly.
+
+    :param retries:
+        Retry configuration to use by default with requests in this pool.
+
+    :param _proxy:
+        Parsed proxy URL, should not be used directly, instead, see
+        :class:`urllib3.ProxyManager`
+
+    :param _proxy_headers:
+        A dictionary with proxy headers, should not be used directly,
+        instead, see :class:`urllib3.ProxyManager`
+
+    :param \**conn_kw:
+        Additional parameters are used to create fresh :class:`urllib3.connection.HTTPConnection`,
+        :class:`urllib3.connection.HTTPSConnection` instances.
+    """
+
+    #: Default model configuration: 3 models, each with 3 machines.
+    DEFAULT_MODEL_CONFIG: dict[str, list[tuple[str, int]]] = {
+        "model1": [("192.168.43.162", 8001), ("192.168.43.162", 8002), ("192.168.43.162", 8003)],
+        "model2": [("10.0.1.1", 8002), ("10.0.1.2", 8002), ("10.0.1.3", 8002)],
+        "model3": [("10.0.2.1", 8003), ("10.0.2.2", 8003), ("10.0.2.3", 8003)],
+    }
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        timeout: _TYPE_TIMEOUT | None = _DEFAULT_TIMEOUT,
+        maxsize: int = 1,
+        block: bool = False,
+        headers: typing.Mapping[str, str] | None = None,
+        retries: Retry | bool | int | None = None,
+        _proxy: Url | None = None,
+        _proxy_headers: typing.Mapping[str, str] | None = None,
+        _proxy_config: ProxyConfig | None = None,
+        model_config: dict[str, list[tuple[str, int]]] | None = None,
+        **conn_kw: typing.Any,
+    ):
+        # Resolve model configuration before calling super().__init__
+        self.model_config = model_config or self.DEFAULT_MODEL_CONFIG
+        self.model_name = host
+
+        if self.model_name not in self.model_config:
+            raise ValueError(
+                f"Unknown model: {self.model_name!r}. "
+                f"Available models: {list(self.model_config.keys())}"
+            )
+
+        self.machines: list[tuple[str, int]] = self.model_config[self.model_name]
+        if not self.machines:
+            raise ValueError(
+                f"Model {self.model_name!r} has no machines configured."
+            )
+
+        # Initialize parent with model name as the logical host.
+        # The parent sets up: timeout, retries, headers, proxy, conn_kw,
+        # self.pool (single LifoQueue), self.block, etc.
+        super().__init__(
+            host,
+            port,
+            timeout=timeout,
+            maxsize=maxsize,
+            block=block,
+            headers=headers,
+            retries=retries,
+            _proxy=_proxy,
+            _proxy_headers=_proxy_headers,
+            _proxy_config=_proxy_config,
+            **conn_kw,
+        )
+
+        # Override: replace the parent's single self.pool with per-machine
+        # connection pools. Each machine gets its own LifoQueue of size
+        # ``maxsize``, managing exactly ``maxsize`` TCP connections.
+        self._machine_pools: dict[
+            tuple[str, int], queue.LifoQueue[typing.Any]
+        ] = {}
+        for machine_host, machine_port in self.machines:
+            q: queue.LifoQueue[typing.Any] = self.QueueCls(maxsize)
+            for _ in range(maxsize):
+                q.put(None)
+            self._machine_pools[(machine_host, machine_port)] = q
+
+        # Thread-local storage for per-request routing context.
+        # Used to pass headers from urlopen() down to _select_machine()
+        # without changing the _get_conn/_new_conn signatures.
+        self._local = threading.local()
+
+        # Register cleanup for machine pools on GC
+        machine_pools = self._machine_pools
+        weakref.finalize(self, _close_llm_machine_pools, machine_pools)
+
+    def _select_machine(self) -> tuple[str, int]:
+        """
+        Select a backend machine based on the current request's headers.
+
+        Reads ``model_name`` and ``server_idx`` from the per-request
+        headers stored in ``_local.headers`` (set by :meth:`urlopen`).
+
+        - ``model_name``: identifies which model to route to.
+          Must match ``self.model_name``.
+        - ``server_idx``: zero-based index of the target machine
+          within the model's machine list.
+
+        If ``server_idx`` is not provided or invalid, falls back to
+        machine index 0.
+
+        Returns the ``(host, port)`` tuple of the selected machine.
+
+        :raises ValueError:
+            If ``model_name`` in headers does not match this pool's model.
+        """
+        headers = getattr(self._local, "headers", None) or {}
+
+        # Resolve server index
+        server_idx: int = 0
+        header_idx = headers.get("server_idx")
+        if header_idx is not None:
+            try:
+                server_idx = int(header_idx)
+            except (ValueError, TypeError):
+                log.warning(
+                    "Invalid server_idx header value %r, falling back to 0",
+                    header_idx,
+                )
+                server_idx = 0
+
+        # Bounds check
+        if server_idx < 0 or server_idx >= len(self.machines):
+            log.warning(
+                "server_idx %d out of range [0, %d), falling back to 0",
+                server_idx,
+                len(self.machines),
+            )
+            server_idx = 0
+
+        selected = self.machines[server_idx]
+        log.debug(
+            "Header-routed to machine %d/%d for model %s: %s:%s",
+            server_idx + 1,
+            len(self.machines),
+            self.model_name,
+            selected[0],
+            selected[1],
+        )
+        return selected
+
+    def _new_conn(self) -> BaseHTTPConnection:
+        """
+        Create a fresh :class:`HTTPConnection` to the header-selected
+        backend machine.
+
+        Overrides the parent to create connections to the selected machine
+        instead of ``self.host``/``self.port``.
+        """
+        machine_host, machine_port = self._select_machine()
+        self.num_connections += 1
+        log.debug(
+            "Starting new HTTP connection (%d) to model %s machine %s:%s",
+            self.num_connections,
+            self.model_name,
+            machine_host,
+            machine_port,
+        )
+        return self.ConnectionCls(
+            host=machine_host,
+            port=machine_port,
+            timeout=self.timeout.connect_timeout,
+            **self.conn_kw,
+        )
+
+    def _get_conn(self, timeout: float | None = None) -> BaseHTTPConnection:
+        """
+        Get a connection using header-based machine selection.
+
+        Reads ``model_name`` and ``server_idx`` from the request headers
+        (stored in ``_local.headers`` by :meth:`urlopen`), selects the
+        target machine, then attempts to get an available connection from
+        that machine's LifoQueue.
+
+        :param timeout:
+            Seconds to wait before giving up and raising
+            :class:`urllib3.exceptions.EmptyPoolError` if the pool is
+            empty and ``block`` is ``True``.
+        """
+        if self.pool is None:
+            raise ClosedPoolError(self, "Pool is closed.")
+
+        # Select target machine based on request headers
+        machine_host, machine_port = self._select_machine()
+        machine_pool = self._machine_pools.get((machine_host, machine_port))
+
+        if machine_pool is None:
+            raise ClosedPoolError(
+                self, f"No pool for machine {machine_host}:{machine_port}"
+            )
+
+        conn = None
+        try:
+            conn = machine_pool.get(block=self.block, timeout=timeout)
+        except queue.Empty:
+            if self.block:
+                raise EmptyPoolError(
+                    self,
+                    "Pool is empty and a new connection can't be "
+                    "opened due to blocking mode.",
+                ) from None
+            # Non-blocking: we'll create a fresh connection below
+            pass
+
+        # If this is a persistent connection, check if it got disconnected
+        if conn and is_connection_dropped(conn):
+            log.debug(
+                "Resetting dropped connection: %s:%s",
+                machine_host,
+                machine_port,
+            )
+            conn.close()
+
+        return conn or self._new_conn()
+
+    def _put_conn(self, conn: BaseHTTPConnection | None) -> None:
+        """
+        Return a connection to its machine's queue in the pool.
+
+        Overrides the parent to route the connection back to the correct
+        machine's LifoQueue based on ``conn.host`` and ``conn.port``.
+        """
+        if conn is None:
+            return
+
+        machine_key = (conn.host, conn.port)
+        machine_pool = self._machine_pools.get(machine_key)
+
+        if machine_pool is not None:
+            try:
+                machine_pool.put(conn, block=False)
+                return  # Everything is dandy, done.
+            except queue.Full:
+                # Machine pool is full, discard the connection
+                if conn:
+                    conn.close()
+
+                if self.block:
+                    raise FullPoolError(
+                        self,
+                        "Pool reached maximum size and no more connections "
+                        "are allowed.",
+                    ) from None
+
+                log.warning(
+                    "Machine pool is full, discarding connection: %s:%s. "
+                    "Pool size: %s",
+                    machine_key[0],
+                    machine_key[1],
+                    machine_pool.qsize(),
+                )
+                return
+
+        # Unknown machine or pool closed — close the connection
+        if conn:
+            conn.close()
+
+    def close(self) -> None:
+        """
+        Close all pooled connections across all machines and disable the pool.
+        """
+        if self.pool is None:
+            return
+        # Mark pool as closed
+        self.pool = None
+
+        # Close all per-machine connection pools
+        for machine_pool in self._machine_pools.values():
+            _close_pool_connections(machine_pool)
+
+    def urlopen(  # type: ignore[override]
+        self,
+        method: str,
+        url: str,
+        body: _TYPE_BODY | None = None,
+        headers: typing.Mapping[str, str] | None = None,
+        retries: Retry | bool | int | None = None,
+        redirect: bool = True,
+        assert_same_host: bool = True,
+        timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
+        pool_timeout: int | None = None,
+        release_conn: bool | None = None,
+        chunked: bool = False,
+        body_pos: _TYPE_BODY_POSITION | None = None,
+        preload_content: bool = True,
+        decode_content: bool = True,
+        **response_kw: typing.Any,
+    ) -> BaseHTTPResponse:
+        """
+        Get a connection from the pool and perform an HTTP request.
+
+        Overrides the parent to store the request headers in thread-local
+        storage before delegating, so that :meth:`_select_machine` can
+        read ``model_name`` and ``server_idx`` from the headers to route
+        the request to the correct backend machine.
+
+        The ``model_name`` header identifies which model to route to
+        (must match this pool's model). The ``server_idx`` header is a
+        zero-based index selecting which machine within the model to use.
+
+        All other parameters and behavior are identical to
+        :meth:`HTTPConnectionPool.urlopen`.
+        """
+        # Store headers in thread-local storage so _select_machine()
+        # can access them during _get_conn() / _new_conn().
+        log.error("arrive llm http connection pool: %s", url)
+        self._local.headers = headers
+        try:
+            return super().urlopen(
+                method,
+                url,
+                body=body,
+                headers=headers,
+                retries=retries,
+                redirect=redirect,
+                assert_same_host=assert_same_host,
+                timeout=timeout,
+                pool_timeout=pool_timeout,
+                release_conn=release_conn,
+                chunked=chunked,
+                body_pos=body_pos,
+                preload_content=preload_content,
+                decode_content=decode_content,
+                **response_kw,
+            )
+        finally:
+            # Clean up thread-local to avoid stale data
+            self._local.headers = None
+
+    def is_same_host(self, url: str) -> bool:
+        """
+        Check if the given ``url`` is a member of any machine in this
+        model's pool.
+        """
+        return True
+
 
 class HTTPSConnectionPool(HTTPConnectionPool):
     """
@@ -1189,3 +1586,11 @@ def _close_pool_connections(pool: queue.LifoQueue[typing.Any]) -> None:
                 conn.close()
     except queue.Empty:
         pass  # Done.
+
+
+def _close_llm_machine_pools(
+    machine_pools: dict[tuple[str, int], queue.LifoQueue[typing.Any]],
+) -> None:
+    """Close all connections in all LLM machine pools. Used by weakref.finalize."""
+    for machine_pool in machine_pools.values():
+        _close_pool_connections(machine_pool)
